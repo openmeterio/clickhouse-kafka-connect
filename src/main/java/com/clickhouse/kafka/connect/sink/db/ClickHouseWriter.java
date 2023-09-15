@@ -13,6 +13,8 @@ import com.clickhouse.kafka.connect.sink.db.helper.ClickHouseHelperClient;
 import com.clickhouse.kafka.connect.sink.db.mapping.Column;
 import com.clickhouse.kafka.connect.sink.db.mapping.Table;
 import com.clickhouse.kafka.connect.sink.db.mapping.Type;
+import com.clickhouse.kafka.connect.sink.dlq.DuplicateException;
+import com.clickhouse.kafka.connect.sink.dlq.ErrorReporter;
 import com.clickhouse.kafka.connect.util.Mask;
 
 import com.clickhouse.kafka.connect.util.Utils;
@@ -37,7 +39,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 
-public class ClickHouseWriter implements DBWriter{
+public class ClickHouseWriter implements DBWriter {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(ClickHouseWriter.class);
 
@@ -49,7 +51,7 @@ public class ClickHouseWriter implements DBWriter{
     private boolean isBinary = false;
 
     public ClickHouseWriter() {
-        this.mapping = new HashMap<>();
+        this.mapping = new HashMap<String, Table>();
     }
 
     @Override
@@ -72,16 +74,33 @@ public class ClickHouseWriter implements DBWriter{
 
         LOGGER.debug("Ping was successful.");
 
-        List<Table> tableList = chc.extractTablesMapping();
-        if (tableList.isEmpty()) {
+        this.updateMapping();
+        if (mapping.isEmpty()) {
             LOGGER.error("Did not find any tables in destination Please create before running.");
             return false;
         }
 
-        for (Table table: tableList) {//TODO: Should we pull ALL tables in memory?
-            this.mapping.put(table.getName(), table);
-        }
         return true;
+    }
+    public void updateMapping() {
+        LOGGER.debug("Update table mapping.");
+
+        // Getting tables from ClickHouse
+        List<Table> tableList = this.chc.extractTablesMapping();
+        if (tableList.isEmpty()) {
+            return;
+        }
+
+        HashMap<String, Table> mapping = new HashMap<String, Table>();
+
+        // Adding new tables to mapping
+        // TODO: check Kafka Connect's topics name or topics regex config and
+        // only add tables to in-memory mapping that matches the topics we consume.
+        for (Table table: tableList) {
+            mapping.put(table.getName(), table);
+        }
+
+        this.mapping = mapping;
     }
 
     @Override
@@ -119,8 +138,11 @@ public class ClickHouseWriter implements DBWriter{
         return chc.getServer();
     }
 
-    @Override
     public void doInsert(List<Record> records) {
+        doInsert(records, null);
+    }
+    @Override
+    public void doInsert(List<Record> records, ErrorReporter errorReporter) {
         if ( records.isEmpty() )
             return;
 
@@ -148,7 +170,12 @@ public class ClickHouseWriter implements DBWriter{
             }
         } catch (Exception e) {
             LOGGER.trace("Passing the exception to the exception handler.");
-            Utils.handleException(e);
+            Utils.handleException(e, csc.getErrorsTolerance());
+            if (csc.getErrorsTolerance() && errorReporter != null) {
+                records.forEach( r ->
+                        Utils.sendTODlq(errorReporter, r, e)
+                );
+            }
         }
     }
 
